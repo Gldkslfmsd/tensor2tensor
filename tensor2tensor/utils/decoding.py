@@ -200,7 +200,7 @@ def decode_from_dataset(estimator,
     tf.logging.info("Completed inference on %d samples." % num_predictions)  # pylint: disable=undefined-loop-variable
 
 
-def decode_from_file(estimator, filename, decode_hp, decode_to_file=None):
+def decode_from_file(estimator, filename, decode_hp, decode_to_file=None, checkpoint_path=None):
   """Compute predictions on entries in filename and write them out."""
   if not decode_hp.batch_size:
     decode_hp.batch_size = 32
@@ -230,7 +230,7 @@ def decode_from_file(estimator, filename, decode_hp, decode_to_file=None):
     return _decode_input_tensor_to_features_dict(example, hparams)
 
   decodes = []
-  result_iter = estimator.predict(input_fn)
+  result_iter = estimator.predict(input_fn, checkpoint_path=checkpoint_path)
   for result in result_iter:
     if decode_hp.return_beams:
       beam_decodes = []
@@ -252,17 +252,14 @@ def decode_from_file(estimator, filename, decode_hp, decode_to_file=None):
   # _decode_batch_input_fn
   sorted_inputs.reverse()
   decodes.reverse()
-  # Dumping inputs and outputs to file filename.decodes in
-  # format result\tinput in the same order as original inputs
-  if decode_to_file:
-    output_filename = decode_to_file
-  else:
-    output_filename = filename
+  # If decode_to_file was provided use it as the output filename without any change
+  # (except for adding shard_id if using more shards for decoding).
+  # Otherwise, use the input filename plus model, hp, problem, beam, alpha.
+  decode_filename = decode_to_file if decode_to_file else filename
   if decode_hp.shards > 1:
-    base_filename = output_filename + ("%.2d" % decode_hp.shard_id)
-  else:
-    base_filename = output_filename
-  decode_filename = _decode_filename(base_filename, problem_name, decode_hp)
+    decode_filename = decode_filename + ("%.2d" % decode_hp.shard_id)
+  if not decode_to_file:
+    decode_filename = _decode_filename(decode_filename, problem_name, decode_hp)
   tf.logging.info("Writing decodes into %s" % decode_filename)
   outfile = tf.gfile.Open(decode_filename, "w")
   for index in range(len(sorted_inputs)):
