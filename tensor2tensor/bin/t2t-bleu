@@ -62,6 +62,9 @@ from tensor2tensor.utils import decoding
 from tensor2tensor.utils import trainer_utils
 from tensor2tensor.utils import usr_dir
 from tensor2tensor.utils import bleu_hook
+from tensor2tensor.utils import registry
+from tensor2tensor import _set_time_logging
+
 import tensorflow as tf
 
 flags = tf.flags
@@ -69,6 +72,8 @@ FLAGS = flags.FLAGS
 
 # t2t-bleu specific options
 flags.DEFINE_string("bleu_variant", "both", "Possible values: cased(case-sensitive), uncased, both(default).")
+flags.DEFINE_bool("postprocess", True, "Postprocess translation and reference before calculating BLEU. True, False(default).")
+flags.DEFINE_string("postprocess_suffix", ".post", "Possible values: True, False(default).")
 flags.DEFINE_string("model_dir", "", "Directory to load model checkpoints from.")
 flags.DEFINE_string("translation", None, "Path to the MT system translation file")
 flags.DEFINE_string("source", None, "Path to the source-language file to be translated")
@@ -92,28 +97,60 @@ flags.DEFINE_string("master", "", "Address of TensorFlow master.")
 flags.DEFINE_string("schedule", "train_and_evaluate",
                     "Must be train_and_evaluate for decoding.")
 
-Model = namedtuple('Model', 'filename time steps')
-
+Model = namedtuple('Model', 'filename time steps') 
 
 def read_checkpoints_list(model_dir, min_steps):
   models = [Model(x[:-6], os.path.getctime(x), int(x[:-6].rsplit('-')[-1]))
             for x in tf.gfile.Glob(os.path.join(model_dir, 'model.ckpt-*.index'))]
   return sorted((x for x in models if x.steps > min_steps), key=lambda x: x.steps)
 
+def postprocess(pre, post, problem):
+  if tf.gfile.Exists(post): return
+  with open(pre, "r", encoding="utf-8") as o:
+    with open(post, "w", encoding="utf-8") as p:
+      for _ in range(10): tf.logging.info("postprocessing file %s" % post)
+      p.write(problem.postprocess(o.read()))
+
+def postprocess_maybe_add_suffix(filename, problem):
+  # postprocess reference or translation file, if needed
+  if not filename.endswith(FLAGS.postprocess_suffix):
+    # this creates a new file with ".post" suffix (by default) in the same directory as reference
+    post = filename + FLAGS.postprocess_suffix
+    if not tf.gfile.Exists(post):
+      postprocess(filename, post, problem)
+    return post
+  return filename
+
 def main(_):
+  _set_time_logging()  
+
   tf.logging.set_verbosity(tf.logging.INFO)
-  if FLAGS.translation:
+
+  if FLAGS.translation: ## TODO: this variant is not tested
     if FLAGS.model_dir:
       raise ValueError('Cannot specify both --translation and --model_dir.')
-    if FLAGS.bleu_variant in ('uncased', 'both'):
-      bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, FLAGS.translation, case_sensitive=False)
-      print("BLEU_uncased = %6.2f" % bleu)
-    if FLAGS.bleu_variant in ('cased', 'both'):
-      bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, FLAGS.translation, case_sensitive=True)
-      print("BLEU_cased = %6.2f" % bleu)
+
+    def count_bleu(ref, trans, ptag=""):
+      if FLAGS.bleu_variant in ('uncased', 'both'):
+        bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, FLAGS.translation, case_sensitive=False)
+        print("BLEU_uncased%s = %6.2f" % (ptag, bleu))
+      if FLAGS.bleu_variant in ('cased', 'both'):
+        bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, FLAGS.translation, case_sensitive=True)
+        print("BLEU_cased%s = %6.2f" % (ptag, bleu))
+    
+    if FLAGS.postprocess:
+      usr_dir.import_usr_dir(FLAGS.t2t_usr_dir)
+      problem = registry.problem(FLAGS.problems)
+      ref_post = postprocess_maybe_add_suffix(FLAGS.reference)
+      ref_trans = postprocess_maybe_add_suffix(FLAGS.translation)
+      count_bleu(ref_post, ref_trans, ptag="_post")
+    else:
+      count_bleu(FLAGS.reference, FLAGS.translation, ptag="")
     return
 
   usr_dir.import_usr_dir(FLAGS.t2t_usr_dir)
+  problem = registry.problem(FLAGS.problems)
+
   FLAGS.model = FLAGS.model or 'transformer'
   FLAGS.output_dir = FLAGS.model_dir
   trainer_utils.log_registry()
@@ -177,19 +214,36 @@ def main(_):
     model = models.pop(0)
     exit_time, min_steps = model.time + FLAGS.wait_secs, model.steps
     tf.logging.info("Evaluating " + model.filename)
+
     out_file = translated_base_file + '-' + str(model.steps)
+
     tf.logging.set_verbosity(tf.logging.ERROR) # decode_from_file logs all the translations as INFO
     decoding.decode_from_file(estimator, FLAGS.source, decode_hp, out_file, checkpoint_path=model.filename)
     tf.logging.set_verbosity(tf.logging.INFO)
+
+    post_out_file = out_file + FLAGS.postprocess_suffix
+    if problem.needs_postprocessing and FLAGS.postprocess:
+      post_out_file = postprocess_maybe_add_suffix(out_file, problem)
+    else:
+      post_out_file = out_file
+
+    post_reference = postprocess_maybe_add_suffix(FLAGS.reference, problem)
+
     values = []
-    if FLAGS.bleu_variant in ('uncased', 'both'):
-      bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, out_file, case_sensitive=False)
-      values.append(tf.Summary.Value(tag='BLEU_uncased' + FLAGS.tag_suffix, simple_value=bleu))
-      tf.logging.info("%s: BLEU_uncased = %6.2f" % (model.filename, bleu))
-    if FLAGS.bleu_variant in ('cased', 'both'):
-      bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, out_file, case_sensitive=True)
-      values.append(tf.Summary.Value(tag='BLEU_cased' + FLAGS.tag_suffix, simple_value=bleu))
-      tf.logging.info("%s: BLEU_cased = %6.2f" % (model.filename, bleu))
+    def count_bleu(ref, out, ptag=""):  
+      if FLAGS.bleu_variant in ('uncased', 'both'):
+        bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, out_file, case_sensitive=False)
+        values.append(tf.Summary.Value(tag='BLEU_uncased' + ptag + FLAGS.tag_suffix, simple_value=bleu))
+        tf.logging.info("%s: BLEU_uncased%s%s = %6.2f" % (model.filename, ptag, FLAGS.tag_suffix, bleu))
+      if FLAGS.bleu_variant in ('cased', 'both'):
+        bleu = 100 * bleu_hook.bleu_wrapper(FLAGS.reference, out_file, case_sensitive=True)
+        values.append(tf.Summary.Value(tag='BLEU_cased' + ptag + FLAGS.tag_suffix, simple_value=bleu))
+        tf.logging.info("%s: BLEU_uncased%s%s = %6.2f" % (model.filename, ptag, FLAGS.tag_suffix, bleu))
+    if FLAGS.postprocess:
+      count_bleu(post_reference, post_out_file, ptag="_post")
+#    else: ## TODO: else or not ????
+    count_bleu(FLAGS.reference, out_file, ptag="")
+
     writer.add_event(tf.summary.Event(summary=tf.Summary(value=values), wall_time=model.time, step=model.steps))
     writer.flush()
     with open(last_step_file, 'w') as ls_file:
